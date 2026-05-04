@@ -170,6 +170,25 @@
   .reminder-card h3 svg { width: 20px; height: 20px; color: var(--terracotta); }
   .reminder-times { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.65rem 0; }
   .reminder-time-pill { background: var(--white); border: 1px solid var(--border); border-radius: 999px; padding: 0.25rem 0.65rem; font-size: 0.75rem; color: var(--brown-mid); }
+
+  /* Night target card */
+  .night-card { background: linear-gradient(135deg, #2a1503 0%, #3d1c00 100%); color: var(--cream); border-radius: 1rem; padding: 1.25rem; margin-bottom: 1.25rem; }
+  .night-card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; font-size: 0.8rem; color: var(--cream-dark); letter-spacing: 0.05em; text-transform: uppercase; font-weight: 600; }
+  .night-card-header svg { width: 16px; height: 16px; color: var(--gold); }
+  .night-target-value { font-family: 'Fraunces', serif; font-size: 2.5rem; font-weight: 800; line-height: 1; color: var(--cream); margin-bottom: 0.25rem; }
+  .night-target-unit { font-size: 1rem; color: var(--cream-dark); font-weight: 500; }
+  .night-target-context { font-size: 0.85rem; color: var(--cream-dark); line-height: 1.5; margin-top: 0.5rem; }
+  .night-target-context strong { color: var(--gold); font-weight: 600; }
+  .night-card-empty { text-align: left; }
+  .night-card-empty h4 { font-family: 'Fraunces', serif; font-size: 1.2rem; font-weight: 600; color: var(--cream); margin-bottom: 0.4rem; }
+  .night-card-empty p { font-size: 0.85rem; color: var(--cream-dark); line-height: 1.55; }
+  .night-status { margin-top: 0.875rem; padding: 0.75rem 0.9rem; border-radius: 0.5rem; font-size: 0.85rem; line-height: 1.5; }
+  .night-status.on-track { background: rgba(168, 200, 130, 0.15); border: 1px solid rgba(168, 200, 130, 0.3); color: #c8e0a0; }
+  .night-status.behind { background: rgba(232, 132, 26, 0.15); border: 1px solid rgba(232, 132, 26, 0.35); color: #f0ba6e; }
+  .night-status.ahead { background: rgba(168, 200, 130, 0.2); border: 1px solid rgba(168, 200, 130, 0.4); color: #d4eab0; }
+  .night-status strong { color: inherit; }
+  .gain-rate-strip { display: flex; gap: 0.75rem; margin-top: 0.875rem; padding-top: 0.875rem; border-top: 1px solid rgba(232, 213, 183, 0.15); font-size: 0.78rem; color: var(--cream-dark); flex-wrap: wrap; }
+  .gain-rate-strip span strong { color: var(--gold); font-weight: 600; }
   .btn svg { width: 14px; height: 14px; }
 
   /* Form */
@@ -236,6 +255,8 @@
 const STARTING_WEIGHT = 57;
 const GOAL_WEIGHT = 70;
 const PLAN_DAYS = 60;
+const DAILY_GAIN_TARGET = 0.15; // kg per day (steady pace)
+const MIN_PAIRS_FOR_OVERNIGHT_AVG = 3; // need this many night→morning pairs before we trust the average
 
 // ---- Meal pools (Nigerian, calorie-dense, designed for low appetite) ----
 const POOLS = {
@@ -408,6 +429,7 @@ let state = {
   startDate: null,
   newWeight: '',
   newWeightDate: new Date().toISOString().slice(0, 10),
+  newWeightTime: 'morning', // 'morning' | 'night'
   customMeals: {},   // {poolName: [{id, dish, cal, custom: true}]}
   disabledMeals: {}, // {mealId: true}
   editingMeal: null, // {pool, mealId} for edit, {pool} for new
@@ -466,6 +488,104 @@ function generatePlan(count) {
 
 async function savePlan() {
   await Storage.set(KEYS.todayPrefix + todayKey(), JSON.stringify({ count: state.mealCount, plan: state.todayPlan }));
+}
+
+// ---- Weight analytics: morning/night pairs, overnight loss, gain rate ----
+
+// Helper: get next-day date string
+function nextDay(dateStr) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+// Build pairs: each night weight matched with the following morning weight
+function getOvernightPairs() {
+  const morning = {};
+  const night = {};
+  state.weights.forEach(w => {
+    const t = w.time || 'morning';
+    if (t === 'morning') morning[w.date] = w.weight;
+    else night[w.date] = w.weight;
+  });
+  const pairs = [];
+  Object.keys(night).forEach(nightDate => {
+    const morningDate = nextDay(nightDate);
+    if (morning[morningDate] != null) {
+      pairs.push({
+        nightDate,
+        morningDate,
+        nightWeight: night[nightDate],
+        morningWeight: morning[morningDate],
+        loss: night[nightDate] - morning[morningDate],
+      });
+    }
+  });
+  // Sort newest first
+  return pairs.sort((a, b) => b.nightDate.localeCompare(a.nightDate));
+}
+
+// Average overnight loss from the most recent N pairs (default 7)
+function getOvernightLossAvg(maxPairs = 7) {
+  const pairs = getOvernightPairs();
+  if (pairs.length < MIN_PAIRS_FOR_OVERNIGHT_AVG) {
+    return { value: null, pairsUsed: pairs.length, totalPairs: pairs.length };
+  }
+  const recent = pairs.slice(0, maxPairs);
+  const avg = recent.reduce((s, p) => s + p.loss, 0) / recent.length;
+  return { value: avg, pairsUsed: recent.length, totalPairs: pairs.length };
+}
+
+// Most recent morning weight (or starting weight)
+function getLatestMorning() {
+  const mornings = state.weights.filter(w => (w.time || 'morning') === 'morning')
+    .sort((a, b) => b.date.localeCompare(a.date));
+  return mornings.length > 0 ? mornings[0] : null;
+}
+
+// Most recent night weight
+function getLatestNight() {
+  const nights = state.weights.filter(w => w.time === 'night')
+    .sort((a, b) => b.date.localeCompare(a.date));
+  return nights.length > 0 ? nights[0] : null;
+}
+
+// Calculate tonight's target = latest morning + overnight loss + daily gain target
+// If no overnight loss data yet, return null
+function getTonightTarget() {
+  const latestMorning = getLatestMorning();
+  if (!latestMorning) return { value: null, reason: 'no-morning' };
+  const overnight = getOvernightLossAvg();
+  if (overnight.value == null) return { value: null, reason: 'no-pairs', pairsHave: overnight.totalPairs };
+  const target = latestMorning.weight + overnight.value + DAILY_GAIN_TARGET;
+  return {
+    value: target,
+    morningBase: latestMorning.weight,
+    morningDate: latestMorning.date,
+    overnightLoss: overnight.value,
+    pairsUsed: overnight.pairsUsed,
+  };
+}
+
+// Predict tomorrow morning's weight given a night weight: night - overnight loss
+function predictTomorrowMorning(nightWeight) {
+  const overnight = getOvernightLossAvg();
+  if (overnight.value == null) return null;
+  return nightWeight - overnight.value;
+}
+
+// Rolling 7-day morning gain rate (kg/day)
+function getMorningGainRate() {
+  const mornings = state.weights.filter(w => (w.time || 'morning') === 'morning')
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (mornings.length < 2) return null;
+  // Use up to last 7 mornings
+  const recent = mornings.slice(-7);
+  const first = recent[0];
+  const last = recent[recent.length - 1];
+  const days = (new Date(last.date) - new Date(first.date)) / 86400000;
+  if (days <= 0) return null;
+  return (last.weight - first.weight) / days;
 }
 
 // ---- Init ----
@@ -574,15 +694,24 @@ async function toggleMeal(slotIndex) {
 async function logWeight() {
   const num = parseFloat(state.newWeight);
   if (isNaN(num) || num <= 0) return;
-  const filtered = state.weights.filter(w => w.date !== state.newWeightDate);
-  state.weights = [...filtered, { date: state.newWeightDate, weight: num }].sort((a, b) => a.date.localeCompare(b.date));
+  const time = state.newWeightTime || 'morning';
+  // Replace any existing entry for the same date + time
+  const filtered = state.weights.filter(w => !(w.date === state.newWeightDate && (w.time || 'morning') === time));
+  state.weights = [...filtered, { date: state.newWeightDate, time, weight: num }]
+    .sort((a, b) => {
+      if (a.date !== b.date) return a.date.localeCompare(b.date);
+      // morning before night on same date
+      const ta = (a.time || 'morning') === 'morning' ? 0 : 1;
+      const tb = (b.time || 'morning') === 'morning' ? 0 : 1;
+      return ta - tb;
+    });
   state.newWeight = '';
   await Storage.set(KEYS.weights, JSON.stringify(state.weights));
   render();
 }
 
-async function removeWeight(date) {
-  state.weights = state.weights.filter(w => w.date !== date);
+async function removeWeight(date, time) {
+  state.weights = state.weights.filter(w => !(w.date === date && (w.time || 'morning') === (time || 'morning')));
   await Storage.set(KEYS.weights, JSON.stringify(state.weights));
   render();
 }
@@ -833,7 +962,11 @@ const I = {
 // ---- Render ----
 function render() {
   const app = document.getElementById('app');
-  const currentWeight = state.weights.length > 0 ? state.weights[state.weights.length - 1].weight : STARTING_WEIGHT;
+  // Prefer most recent morning weight as the "official" current; fall back to most recent of any kind
+  const morningEntries = state.weights.filter(w => (w.time || 'morning') === 'morning');
+  const currentWeight = morningEntries.length > 0
+    ? morningEntries[morningEntries.length - 1].weight
+    : (state.weights.length > 0 ? state.weights[state.weights.length - 1].weight : STARTING_WEIGHT);
   const gained = (currentWeight - STARTING_WEIGHT).toFixed(1);
   const remaining = (GOAL_WEIGHT - currentWeight).toFixed(1);
   const progressPct = Math.max(0, Math.min(100, ((currentWeight - STARTING_WEIGHT) / (GOAL_WEIGHT - STARTING_WEIGHT)) * 100));
@@ -917,10 +1050,85 @@ function tabBtn(id, icon, label) {
   return `<button class="tab-btn ${state.tab === id ? 'active' : ''}" data-tab="${id}">${icon}${label}</button>`;
 }
 
+function renderNightTargetCard() {
+  const target = getTonightTarget();
+  const latestNight = getLatestNight();
+  const gainRate = getMorningGainRate();
+  const overnight = getOvernightLossAvg();
+  const todayNight = state.weights.find(w => w.date === todayKey() && w.time === 'night');
+
+  // Empty state — not enough data yet
+  if (target.value == null) {
+    let message;
+    if (target.reason === 'no-morning') {
+      message = 'Log your first morning weight on the Progress tab to get started.';
+    } else {
+      const have = target.pairsHave || 0;
+      const need = MIN_PAIRS_FOR_OVERNIGHT_AVG - have;
+      message = `Need ${need} more night→morning pair${need === 1 ? '' : 's'} to learn your personal overnight loss. So far: ${have} pair${have === 1 ? '' : 's'}. Keep logging both morning and night weights every day.`;
+    }
+    return `
+      <div class="night-card">
+        <div class="night-card-header">${I.target} Tonight's Target</div>
+        <div class="night-card-empty">
+          <h4>Calibrating to your body…</h4>
+          <p>${message}</p>
+        </div>
+      </div>
+    `;
+  }
+
+  // Have a target — show it
+  const targetVal = target.value.toFixed(1);
+  const tomorrowMorning = target.morningBase + DAILY_GAIN_TARGET;
+
+  let statusBlock = '';
+  if (todayNight) {
+    const predicted = predictTomorrowMorning(todayNight.weight);
+    const diff = todayNight.weight - target.value;
+    const predictedGain = predicted - target.morningBase;
+    let cls, label, advice;
+    if (diff >= -0.1) {
+      cls = 'on-track';
+      label = '✓ On track';
+      advice = `You logged <strong>${todayNight.weight} kg</strong> tonight. You're predicted to wake up around <strong>${predicted.toFixed(1)} kg</strong> — that's a <strong>${predictedGain >= 0 ? '+' : ''}${predictedGain.toFixed(2)} kg</strong> gain from yesterday morning. Sleep well.`;
+      if (diff >= 0.3) { cls = 'ahead'; label = '✓✓ Ahead of target'; }
+    } else {
+      cls = 'behind';
+      label = '⚠ Behind target';
+      const shortBy = Math.abs(diff).toFixed(2);
+      advice = `You logged <strong>${todayNight.weight} kg</strong> tonight — short by <strong>${shortBy} kg</strong>. You're predicted to wake up around <strong>${predicted.toFixed(1)} kg</strong>, which is <strong>${(predicted - target.morningBase).toFixed(2)} kg</strong> ${predicted >= target.morningBase ? 'above' : 'below'} yesterday's morning. Add a smoothie or bedtime shake before bed if you can.`;
+    }
+    statusBlock = `<div class="night-status ${cls}"><strong>${label}.</strong> ${advice}</div>`;
+  }
+
+  // Gain rate strip at the bottom
+  const rateText = gainRate != null
+    ? `<strong>${gainRate >= 0 ? '+' : ''}${(gainRate * 1000).toFixed(0)}g/day</strong> recent gain rate`
+    : `<strong>—</strong> not enough mornings yet`;
+  const lossText = `<strong>${overnight.value.toFixed(2)} kg</strong> avg overnight loss <span style="opacity:0.7">(${overnight.pairsUsed} pair${overnight.pairsUsed === 1 ? '' : 's'})</span>`;
+
+  return `
+    <div class="night-card">
+      <div class="night-card-header">${I.target} Tonight's Target</div>
+      <div class="night-target-value">${targetVal} <span class="night-target-unit">kg</span></div>
+      <div class="night-target-context">
+        Hit this tonight to wake up at <strong>${tomorrowMorning.toFixed(1)} kg</strong> — that's <strong>+${DAILY_GAIN_TARGET} kg</strong> from yesterday's <strong>${target.morningBase} kg</strong>.
+      </div>
+      ${statusBlock}
+      <div class="gain-rate-strip">
+        <span>${lossText}</span>
+        <span>${rateText}</span>
+      </div>
+    </div>
+  `;
+}
+
 function renderToday(mealsDone) {
   const config = CONFIGS[state.mealCount];
   const todayLog = state.mealLog[todayKey()] || {};
   return `
+    ${renderNightTargetCard()}
     <div class="card">
       <div class="card-header">
         <h2>Configure Your Day</h2>
@@ -993,7 +1201,11 @@ function renderToday(mealsDone) {
 
     <div class="card">
       <h2>Log a Weigh-in</h2>
-      <p class="form-help">Weigh yourself first thing in the morning, after the bathroom, before food or water. Same scale every time.</p>
+      <p class="form-help">Weigh yourself on the same scale, in light/no clothes. <strong>Morning:</strong> just after waking, after the bathroom, before any food or water. <strong>Night:</strong> right before bed, after dinner has fully digested. Tracking both helps you see the full picture.</p>
+      <div class="meal-count-row" style="margin-bottom: 0.75rem">
+        <button class="count-btn ${state.newWeightTime === 'morning' ? 'active' : ''}" data-time="morning">🌅 Morning</button>
+        <button class="count-btn ${state.newWeightTime === 'night' ? 'active' : ''}" data-time="night">🌙 Night</button>
+      </div>
       <div class="form-row">
         <input type="date" id="weight-date" value="${state.newWeightDate}" />
         <input type="number" step="0.1" placeholder="Weight in kg" id="weight-input" value="${state.newWeight}" />
@@ -1004,12 +1216,18 @@ function renderToday(mealsDone) {
 }
 
 function renderProgress() {
-  const chartData = (() => {
-    const arr = [];
-    if (state.startDate) arr.push({ date: state.startDate, weight: STARTING_WEIGHT });
-    state.weights.forEach(w => { if (w.date !== state.startDate) arr.push(w); });
-    return arr;
-  })();
+  // Build two series: morning and night
+  const morningData = [];
+  const nightData = [];
+  if (state.startDate) morningData.push({ date: state.startDate, weight: STARTING_WEIGHT });
+  state.weights.forEach(w => {
+    const t = w.time || 'morning';
+    const point = { date: w.date, weight: w.weight };
+    if (t === 'morning' && w.date !== state.startDate) morningData.push(point);
+    else if (t === 'night') nightData.push(point);
+    else if (t === 'morning') morningData.push(point);
+  });
+  const hasAnyData = morningData.length >= 2 || nightData.length >= 1;
 
   const config = CONFIGS[state.mealCount];
   const last7 = (() => {
@@ -1036,10 +1254,16 @@ function renderProgress() {
 
   return `
     <div class="card">
-      <h2>Weight Trajectory</h2>
-      ${chartData.length < 2
+      <div class="card-header">
+        <h2>Weight Trajectory</h2>
+        ${hasAnyData ? `<div style="display:flex;gap:0.75rem;font-size:0.75rem;color:var(--brown-mid)">
+          <span style="display:flex;align-items:center;gap:0.3rem"><span style="width:14px;height:3px;background:var(--terracotta);border-radius:2px;display:inline-block"></span>Morning</span>
+          <span style="display:flex;align-items:center;gap:0.3rem"><span style="width:14px;height:3px;background:var(--olive);border-radius:2px;display:inline-block"></span>Night</span>
+        </div>` : ''}
+      </div>
+      ${!hasAnyData
         ? `<div class="empty-chart">Log at least one weigh-in to see your trend.</div>`
-        : renderSVGChart(chartData)}
+        : renderSVGChart(morningData, nightData)}
     </div>
 
     <div class="card">
@@ -1062,21 +1286,29 @@ function renderProgress() {
       <h2>Weigh-in History</h2>
       ${state.weights.length === 0
         ? `<div style="color:var(--tan);font-size:0.875rem">No entries yet.</div>`
-        : [...state.weights].reverse().map((w, i) => {
-            const prev = state.weights[state.weights.length - 2 - i];
-            const delta = prev ? (w.weight - prev.weight).toFixed(1) : null;
-            return `
-              <div class="weight-row">
-                <div>
-                  <div class="weight-amount">${w.weight} kg</div>
-                  <div class="weight-date">${w.date}</div>
-                </div>
-                <div style="display:flex;align-items:center;gap:0.5rem">
-                  ${delta !== null ? `<span class="weight-delta ${parseFloat(delta) >= 0 ? 'delta-up' : 'delta-down'}">${parseFloat(delta) >= 0 ? '+' : ''}${delta} kg</span>` : ''}
-                  <button class="delete-btn" data-delete="${w.date}" title="Delete entry">${I.trash}</button>
-                </div>
-              </div>`;
-          }).join('')}
+        : (() => {
+            const reversed = [...state.weights].reverse();
+            return reversed.map((w, i) => {
+              const t = w.time || 'morning';
+              // Find the previous entry of the SAME time of day for a meaningful delta
+              const prev = reversed.slice(i + 1).find(p => (p.time || 'morning') === t);
+              const delta = prev ? (w.weight - prev.weight).toFixed(1) : null;
+              const icon = t === 'night' ? '🌙' : '🌅';
+              const label = t === 'night' ? 'Night' : 'Morning';
+              return `
+                <div class="weight-row">
+                  <div>
+                    <div class="weight-amount">${icon} ${w.weight} kg <span style="font-size:0.7rem;color:var(--tan);font-weight:400">· ${label}</span></div>
+                    <div class="weight-date">${w.date}</div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:0.5rem">
+                    ${delta !== null ? `<span class="weight-delta ${parseFloat(delta) >= 0 ? 'delta-up' : 'delta-down'}">${parseFloat(delta) >= 0 ? '+' : ''}${delta} kg</span>` : ''}
+                    <button class="delete-btn" data-delete="${w.date}|${t}" title="Delete entry">${I.trash}</button>
+                  </div>
+                </div>`;
+            }).join('');
+          })()
+      }
     </div>
 
     <div class="card">
@@ -1095,22 +1327,41 @@ function renderProgress() {
   `;
 }
 
-function renderSVGChart(data) {
-  // Simple SVG line chart
+function renderSVGChart(morningData, nightData) {
+  morningData = morningData || [];
+  nightData = nightData || [];
   const W = 700, H = 280;
   const pad = { l: 40, r: 20, t: 20, b: 30 };
   const innerW = W - pad.l - pad.r;
   const innerH = H - pad.t - pad.b;
-  const minWeight = Math.floor(Math.min(STARTING_WEIGHT - 1, ...data.map(d => d.weight)));
-  const maxWeight = Math.ceil(Math.max(GOAL_WEIGHT + 1, ...data.map(d => d.weight)));
+
+  // Build a sorted list of unique dates across both series for shared x-axis
+  const allDates = Array.from(new Set([...morningData, ...nightData].map(d => d.date))).sort();
+  if (allDates.length === 0) return '<div class="empty-chart">No data yet.</div>';
+
+  const allWeights = [...morningData, ...nightData].map(d => d.weight);
+  const minWeight = Math.floor(Math.min(STARTING_WEIGHT - 1, ...allWeights));
+  const maxWeight = Math.ceil(Math.max(GOAL_WEIGHT + 1, ...allWeights));
   const yScale = w => pad.t + innerH - ((w - minWeight) / (maxWeight - minWeight)) * innerH;
-  const xScale = i => pad.l + (data.length === 1 ? innerW / 2 : (i / (data.length - 1)) * innerW);
+  const xScale = date => {
+    const idx = allDates.indexOf(date);
+    if (allDates.length === 1) return pad.l + innerW / 2;
+    return pad.l + (idx / (allDates.length - 1)) * innerW;
+  };
 
   const goalY = yScale(GOAL_WEIGHT);
-  const startY = yScale(STARTING_WEIGHT);
 
-  const points = data.map((d, i) => `${xScale(i)},${yScale(d.weight)}`).join(' ');
-  const areaPoints = `${pad.l},${pad.t + innerH} ` + points + ` ${xScale(data.length - 1)},${pad.t + innerH}`;
+  const buildSeries = (data, color, isPrimary) => {
+    if (!data.length) return '';
+    const points = data.map(d => `${xScale(d.date)},${yScale(d.weight)}`).join(' ');
+    let area = '';
+    if (isPrimary && data.length > 1) {
+      const areaPoints = `${xScale(data[0].date)},${pad.t + innerH} ` + points + ` ${xScale(data[data.length - 1].date)},${pad.t + innerH}`;
+      area = `<polygon points="${areaPoints}" fill="url(#areaGrad)"/>`;
+    }
+    const dots = data.map(d => `<circle cx="${xScale(d.date)}" cy="${yScale(d.weight)}" r="4" fill="${color}"/>`).join('');
+    return `${area}<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>${dots}`;
+  };
 
   // Y-axis labels
   const yTicks = [];
@@ -1123,7 +1374,7 @@ function renderSVGChart(data) {
       <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" width="100%" height="100%" style="overflow:visible">
         <defs>
           <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#c8602b" stop-opacity="0.4"/>
+            <stop offset="0%" stop-color="#c8602b" stop-opacity="0.35"/>
             <stop offset="100%" stop-color="#c8602b" stop-opacity="0"/>
           </linearGradient>
         </defs>
@@ -1133,11 +1384,10 @@ function renderSVGChart(data) {
         `).join('')}
         <line x1="${pad.l}" y1="${goalY}" x2="${W - pad.r}" y2="${goalY}" stroke="#5c8a3a" stroke-dasharray="4 4" stroke-width="1.5"/>
         <text x="${W - pad.r}" y="${goalY - 6}" text-anchor="end" font-size="11" fill="#5c8a3a" font-weight="600">Goal ${GOAL_WEIGHT}kg</text>
-        <polygon points="${areaPoints}" fill="url(#areaGrad)"/>
-        <polyline points="${points}" fill="none" stroke="#c8602b" stroke-width="2.5" stroke-linejoin="round"/>
-        ${data.map((d, i) => `
-          <circle cx="${xScale(i)}" cy="${yScale(d.weight)}" r="4" fill="#c8602b"/>
-          <text x="${xScale(i)}" y="${H - pad.b + 18}" text-anchor="middle" font-size="10" fill="#8b5e3c">${d.date.slice(5)}</text>
+        ${buildSeries(morningData, '#c8602b', true)}
+        ${buildSeries(nightData, '#5c8a3a', false)}
+        ${allDates.map(date => `
+          <text x="${xScale(date)}" y="${H - pad.b + 18}" text-anchor="middle" font-size="10" fill="#8b5e3c">${date.slice(5)}</text>
         `).join('')}
       </svg>
     </div>
@@ -1275,9 +1525,16 @@ function renderTips() {
 function attachHandlers() {
   document.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
   document.querySelectorAll('[data-count]').forEach(b => b.addEventListener('click', () => setMealCount(parseInt(b.dataset.count, 10))));
+  document.querySelectorAll('[data-time]').forEach(b => b.addEventListener('click', () => {
+    state.newWeightTime = b.dataset.time;
+    render();
+  }));
   document.querySelectorAll('[data-toggle]').forEach(b => b.addEventListener('click', () => toggleMeal(parseInt(b.dataset.toggle, 10))));
   document.querySelectorAll('[data-shuffle]').forEach(b => b.addEventListener('click', () => shuffleMeal(parseInt(b.dataset.shuffle, 10))));
-  document.querySelectorAll('[data-delete]').forEach(b => b.addEventListener('click', () => removeWeight(b.dataset.delete)));
+  document.querySelectorAll('[data-delete]').forEach(b => b.addEventListener('click', () => {
+    const parts = b.dataset.delete.split('|');
+    removeWeight(parts[0], parts[1] || 'morning');
+  }));
   const regen = document.getElementById('regen-day');
   if (regen) regen.addEventListener('click', regenerateDay);
   const saveBtn = document.getElementById('save-weight');
@@ -1289,12 +1546,46 @@ function attachHandlers() {
   }
   const wDate = document.getElementById('weight-date');
   if (wDate) wDate.addEventListener('change', e => state.newWeightDate = e.target.value);
+  const wTime = document.getElementById('weight-time');
+  if (wTime) wTime.addEventListener('change', e => state.newWeightTime = e.target.value);
   const exportBtn = document.getElementById('export-data');
   if (exportBtn) exportBtn.addEventListener('click', exportData);
   const importBtn = document.getElementById('import-data');
   if (importBtn) importBtn.addEventListener('click', importData);
   const resetBtn = document.getElementById('reset-data');
   if (resetBtn) resetBtn.addEventListener('click', resetAllData);
+
+  // Meal library handlers
+  document.querySelectorAll('[data-add-meal]').forEach(b =>
+    b.addEventListener('click', () => startAddMeal(b.dataset.addMeal))
+  );
+  document.querySelectorAll('[data-edit-meal]').forEach(b =>
+    b.addEventListener('click', () => {
+      const [pool, mealId] = b.dataset.editMeal.split('|');
+      startEditMeal(pool, mealId);
+    })
+  );
+  document.querySelectorAll('[data-delete-meal]').forEach(b =>
+    b.addEventListener('click', () => {
+      const [pool, mealId] = b.dataset.deleteMeal.split('|');
+      deleteCustomMeal(pool, mealId);
+    })
+  );
+  document.querySelectorAll('[data-toggle-hidden]').forEach(b =>
+    b.addEventListener('click', () => toggleMealHidden(b.dataset.toggleHidden))
+  );
+  const formDish = document.getElementById('meal-form-dish');
+  if (formDish) formDish.addEventListener('input', e => state.mealForm.dish = e.target.value);
+  const formCal = document.getElementById('meal-form-cal');
+  if (formCal) formCal.addEventListener('input', e => state.mealForm.cal = e.target.value);
+  const formSave = document.getElementById('meal-form-save');
+  if (formSave) formSave.addEventListener('click', saveMealForm);
+  const formCancel = document.getElementById('meal-form-cancel');
+  if (formCancel) formCancel.addEventListener('click', cancelMealEdit);
+
+  // Calendar export
+  const calBtn = document.getElementById('export-calendar');
+  if (calBtn) calBtn.addEventListener('click', exportCalendar);
 }
 
 // Boot
